@@ -839,7 +839,7 @@ static void mdns_announce_netif(struct netif *netif, const ip_addr_t *addr)
 {
     u8_t *mdns_response = malloc(MDNS_RESPONDER_REPLY_SIZE);
     if (mdns_response == NULL) {
-        printf(">>> mdns_reply could not alloc %d\n", MDNS_RESPONDER_REPLY_SIZE);
+        printf(">>> mdns_announce_netif could not alloc %d\n", MDNS_RESPONDER_REPLY_SIZE);
         return;
     }
 
@@ -922,7 +922,7 @@ static void mdns_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_a
 
     // Sanity checks on size
     if (plen > MDNS_RESPONDER_REPLY_SIZE) {
-        printf(">>> mdns_recv: pbuf too big\n");
+        printf(">>> mdns_recv: pbuf too big, %d\n",plen);
     } else if (plen < (SIZEOF_DNS_HDR + SIZEOF_DNS_QUERY + 1 + SIZEOF_DNS_ANSWER + 1)) {
         printf(">>> mdns_recv: pbuf too small\n");
     } else {
