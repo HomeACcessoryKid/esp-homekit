@@ -61,6 +61,18 @@ void json_free(json_stream *json) {
     free(json);
 }
 
+void json_set_context(json_stream *json, void *context) {
+    json->context = context;
+}
+
+
+void json_reset(json_stream *json) {
+    json->pos = 0;
+    json->state = JSON_STATE_START;
+    json->nesting_idx = 0;
+}
+
+
 void json_flush(json_stream *json) {
     if (!json->pos)
         return;
@@ -94,6 +106,9 @@ void json_write(json_stream *json, const char *format, ...) {
         json->pos += len;
     }
 }
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
 
 void json_object_start(json_stream *json) {
     if (json->state == JSON_STATE_ERROR)
@@ -374,4 +389,4 @@ void json_null(json_stream *json) {
             json->state = JSON_STATE_ERROR;
     }
 }
-
+#pragma GCC diagnostic pop
