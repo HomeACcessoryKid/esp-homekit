@@ -103,6 +103,8 @@ typedef struct {
     fd_set fds;
     int max_fd;
 
+    json_stream *json;
+
     int client_count;
     client_context_t *clients;
 } homekit_server_t;
@@ -151,10 +153,15 @@ typedef struct {
 
 void client_context_free(client_context_t *c);
 void pairing_context_free(pairing_context_t *context);
+void client_send_chunk(byte *data, size_t size, void *arg);
 
 
 homekit_server_t *server_new() {
     homekit_server_t *server = malloc(sizeof(homekit_server_t));
+    if (!server) {
+        return NULL;
+    }
+
     FD_ZERO(&server->fds);
     server->max_fd = 0;
     server->client_count = 0;
@@ -162,11 +169,22 @@ homekit_server_t *server_new() {
     server->paired = false;
     server->pairing_context = NULL;
     server->clients = NULL;
+
+    server->json = json_new(1024, client_send_chunk, NULL);
+    if (!server->json) {
+        free(server);
+        return NULL;
+    }
+
     return server;
 }
 
 
 void server_free(homekit_server_t *server) {
+    if (server->json) {
+        json_free(server->json);
+    }
+
     if (server->pairing_context)
         pairing_context_free(server->pairing_context);
 
@@ -281,6 +299,9 @@ typedef enum {
 
 pair_verify_context_t *pair_verify_context_new() {
     pair_verify_context_t *context = malloc(sizeof(pair_verify_context_t));
+    if (!context) {
+        return NULL;
+    }
 
     context->secret = NULL;
     context->secret_size = 0;
@@ -314,6 +335,10 @@ void pair_verify_context_free(pair_verify_context_t *context) {
 
 client_context_t *client_context_new() {
     client_context_t *c = malloc(sizeof(client_context_t));
+    if (!c) {
+        return NULL;
+    }
+
     c->server = NULL;
     c->endpoint_params = NULL;
 
@@ -362,6 +387,10 @@ void client_context_free(client_context_t *c) {
 
 pairing_context_t *pairing_context_new() {
     pairing_context_t *context = malloc(sizeof(pairing_context_t));
+    if (!context) {
+        return NULL;
+    }
+
     context->srp = crypto_srp_new();
     context->client = NULL;
     context->public_key = NULL;
@@ -554,10 +583,25 @@ void write_characteristic_json(json_stream *json, client_context_t *client, cons
                             json_string(json, "");
                         } else {
                             byte *tlv_data = malloc(tlv_size);
-                            tlv_format(v.tlv_values, tlv_data, &tlv_size);
+                            if (!tlv_data) {
+                                CLIENT_ERROR(client, "Failed to allocate %d bytes for characteristic TLV data", tlv_size);
+                                json_string(json, "");
+                                break;
+                            }
+                            if (tlv_format(v.tlv_values, tlv_data, &tlv_size)) {
+                                CLIENT_ERROR(client, "Failed to format TLV characteristic data");
+                                json_string(json, "");
+                                break;
+                            }
 
                             size_t encoded_tlv_size = base64_encoded_size(tlv_data, tlv_size);
                             byte *encoded_tlv_data = malloc(encoded_tlv_size + 1);
+                            if (!encoded_tlv_data) {
+                                CLIENT_ERROR(client, "Failed to allocate %d bytes for encoding characteristic TLV data", encoded_tlv_size + 1);
+                                free(tlv_data);
+                                json_string(json, "");
+                                break;
+                            }
                             base64_encode(tlv_data, tlv_size, encoded_tlv_data);
                             encoded_tlv_data[encoded_tlv_size] = 0;
 
@@ -576,6 +620,11 @@ void write_characteristic_json(json_stream *json, client_context_t *client, cons
                     } else {
                         size_t encoded_data_size = base64_encoded_size(v.data_value, v.data_size);
                         byte *encoded_data = malloc(encoded_data_size + 1);
+                        if (!encoded_data) {
+                            CLIENT_ERROR(client, "Failed to allocate %d bytes for encoding characteristic data", encoded_data_size + 1);
+                            json_string(json, "");
+                            break;
+                        }
                         base64_encode(v.data_value, v.data_size, encoded_data);
                         encoded_data[encoded_data_size] = 0;
 
@@ -723,6 +772,10 @@ void client_notify_characteristic(homekit_characteristic_t *ch, homekit_value_t 
     }
 
     characteristic_event_t *event = malloc(sizeof(characteristic_event_t));
+    if (!event) {
+        ERROR("Failed to allocate %d bytes for notification event. Skipping notification", sizeof(characteristic_event_t));
+        return;
+    }
     event->characteristic = ch;
     homekit_value_copy(&event->value, &value);
 
@@ -758,12 +811,15 @@ void client_send_chunk(byte *data, size_t size, void *arg) {
 
     size_t payload_size = size + 8;
     byte *payload = malloc(payload_size);
+    // TODO: get rid of this allocation
 
     int offset = snprintf((char *)payload, payload_size, "%x\r\n", size);
     memcpy(payload + offset, data, size);
     payload[offset + size] = '\r';
     payload[offset + size + 1] = '\n';
 
+    // TODO: change this API to vectorized form
+    // (so payload is provided as series of pointers)
     client_send(context, payload, offset + size + 2);
 
     free(payload);
@@ -800,9 +856,11 @@ void send_client_events(client_context_t *context, client_event_t *events) {
 
     client_send(context, http_headers, sizeof(http_headers)-1);
 
-    // ~35 bytes per event JSON
-    // 256 should be enough for ~7 characteristic updates
-    json_stream *json = json_new(256, client_send_chunk, context);
+    json_stream *json = context->server->json;
+
+    json_set_context(json, context);
+    json_reset(json);
+
     json_object_start(json);
     json_string(json, "characteristics"); json_array_start(json);
 
@@ -819,7 +877,6 @@ void send_client_events(client_context_t *context, client_event_t *events) {
     json_object_end(json);
 
     json_flush(json);
-    json_free(json);
 
     client_send_chunk(NULL, 0, context);
 }
@@ -829,6 +886,10 @@ void send_tlv_response(client_context_t *context, tlv_values_t *values);
 
 void send_tlv_error_response(client_context_t *context, int state, TLVError error) {
     tlv_values_t *response = tlv_new();
+    if (!response) {
+        // TODO: panic?
+        return;
+    }
     tlv_add_integer_value(response, TLVType_State, 1, state);
     tlv_add_integer_value(response, TLVType_Error, 1, error);
 
@@ -844,6 +905,11 @@ void send_tlv_response(client_context_t *context, tlv_values_t *values) {
     tlv_format(values, NULL, &payload_size);
 
     byte *payload = malloc(payload_size);
+    if (!payload) {
+        CLIENT_ERROR(context, "Failed to allocate %d bytes for TLV payload", payload_size);
+        return;
+    }
+
     int r = tlv_format(values, payload, &payload_size);
     if (r) {
         CLIENT_ERROR(context, "Failed to format TLV payload (code %d)", r);
@@ -861,6 +927,7 @@ void send_tlv_response(client_context_t *context, tlv_values_t *values) {
 
     int response_size = strlen(http_headers) + payload_size + 32;
     char *response = malloc(response_size);
+    // TODO: handle NULL in response
     int response_len = snprintf(response, response_size, http_headers, payload_size);
 
     if (response_size - response_len < payload_size + 1) {
@@ -874,6 +941,7 @@ void send_tlv_response(client_context_t *context, tlv_values_t *values) {
 
     free(payload);
 
+    // TODO: Change this to vectorized form
     client_send(context, (byte *)response, response_len);
 
     free(response);
@@ -920,7 +988,7 @@ void send_json_response(client_context_t *context, int status_code, byte *payloa
     int response_size = strlen(http_headers) + payload_size + strlen(status_text) + 32;
     char *response = malloc(response_size);
     if (!response) {
-        CLIENT_ERROR(context, "Failed to allocate response buffer of size %d", response_size);
+        CLIENT_ERROR(context, "Failed to allocate %d bytes for response buffer", response_size);
         return;
     }
     int response_len = snprintf(response, response_size, http_headers, status_code, status_text, payload_size);
@@ -1017,7 +1085,17 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
 #endif
 
     tlv_values_t *message = tlv_new();
-    tlv_parse(data, size, message);
+    if (!message) {
+        CLIENT_ERROR(context, "Failed to allocate memory for TLV payload");
+        send_tlv_error_response(context, 2, TLVError_Unknown);
+        return;
+    }
+    if (tlv_parse(data, size, message)) {
+        CLIENT_ERROR(context, "Failed to parse TLV payload");
+        tlv_free(message);
+        send_tlv_error_response(context, 2, TLVError_Unknown);
+        return;
+    }
 
     TLV_DEBUG(message);
 
@@ -1039,6 +1117,11 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
                 }
             } else {
                 context->server->pairing_context = pairing_context_new();
+                if (!context->server->pairing_context) {
+                    CLIENT_ERROR(context, "Refusing to pair: failed to allocate memory for pairing context");
+                    send_tlv_error_response(context, 2, TLVError_Unknown);
+                    break;
+                }
                 context->server->pairing_context->client = context;
             }
 
@@ -1075,6 +1158,17 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             crypto_srp_get_public_key(context->server->pairing_context->srp, NULL, &context->server->pairing_context->public_key_size);
 
             context->server->pairing_context->public_key = malloc(context->server->pairing_context->public_key_size);
+            if (!context->server->pairing_context->public_key) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for dumping SPR public key",
+                             context->server->pairing_context->public_key_size);
+
+                pairing_context_free(context->server->pairing_context);
+                context->server->pairing_context = NULL;
+
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
+
             int r = crypto_srp_get_public_key(context->server->pairing_context->srp, context->server->pairing_context->public_key, &context->server->pairing_context->public_key_size);
             if (r) {
                 CLIENT_ERROR(context, "Failed to dump SPR public key (code %d)", r);
@@ -1090,6 +1184,16 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             crypto_srp_get_salt(context->server->pairing_context->srp, NULL, &salt_size);
 
             byte *salt = malloc(salt_size);
+            if (!salt) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for salt", salt_size);
+
+                pairing_context_free(context->server->pairing_context);
+                context->server->pairing_context = NULL;
+
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
+
             r = crypto_srp_get_salt(context->server->pairing_context->srp, salt, &salt_size);
             if (r) {
                 CLIENT_ERROR(context, "Failed to get salt (code %d)", r);
@@ -1103,6 +1207,16 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             }
 
             tlv_values_t *response = tlv_new();
+            if (!response) {
+                CLIENT_ERROR(context, "Failed to allocate memory for TLV response");
+
+                free(salt);
+                pairing_context_free(context->server->pairing_context);
+                context->server->pairing_context = NULL;
+
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
             tlv_add_value(response, TLVType_PublicKey, context->server->pairing_context->public_key, context->server->pairing_context->public_key_size);
             tlv_add_value(response, TLVType_Salt, salt, salt_size);
             tlv_add_integer_value(response, TLVType_State, 1, 2);
@@ -1161,9 +1275,21 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             crypto_srp_get_proof(context->server->pairing_context->srp, NULL, &server_proof_size);
 
             byte *server_proof = malloc(server_proof_size);
+            if (!server_proof) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for own proof", server_proof_size);
+                send_tlv_error_response(context, 4, TLVError_Authentication);
+                break;
+            }
+
             r = crypto_srp_get_proof(context->server->pairing_context->srp, server_proof, &server_proof_size);
 
             tlv_values_t *response = tlv_new();
+            if (!response) {
+                CLIENT_ERROR(context, "Failed to allocate memory for TLV response");
+                free(server_proof);
+                send_tlv_error_response(context, 4, TLVError_Unknown);
+                break;
+            }
             tlv_add_integer_value(response, TLVType_State, 1, 4);
             tlv_add_value(response, TLVType_Proof, server_proof, server_proof_size);
 
@@ -1212,7 +1338,14 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             );
 
             byte *decrypted_data = malloc(decrypted_data_size);
-            // TODO: check malloc result
+            if (!decrypted_data) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for decrypting data",
+                             decrypted_data_size);
+
+                send_tlv_error_response(context, 6, TLVError_Authentication);
+                break;
+            }
+
             r = crypto_chacha20poly1305_decrypt(
                 shared_secret, (byte *)"\x0\x0\x0\x0PS-Msg05", NULL, 0,
                 tlv_encrypted_data->value, tlv_encrypted_data->size,
@@ -1228,6 +1361,15 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             }
 
             tlv_values_t *decrypted_message = tlv_new();
+            if (!decrypted_message) {
+                CLIENT_ERROR(context, "Failed to allocate memory for decrypted TLV");
+
+                free(decrypted_data);
+
+                send_tlv_error_response(context, 6, TLVError_Authentication);
+                break;
+            }
+
             r = tlv_parse(decrypted_data, decrypted_data_size, decrypted_message);
             if (r) {
                 CLIENT_ERROR(context, "Failed to parse decrypted TLV (code %d)", r);
@@ -1313,6 +1455,15 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
 
             size_t device_info_size = device_x_size + tlv_device_id->size + tlv_device_public_key->size;
             byte *device_info = malloc(device_info_size);
+            if (!device_info) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for DeviceX", device_info_size);
+
+                tlv_free(decrypted_message);
+
+                send_tlv_error_response(context, 6, TLVError_Authentication);
+                break;
+            }
+
             memcpy(device_info,
                    device_x,
                    device_x_size);
@@ -1365,6 +1516,14 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             crypto_ed25519_export_public_key(&context->server->accessory_key, NULL, &accessory_public_key_size);
 
             byte *accessory_public_key = malloc(accessory_public_key_size);
+            if (!accessory_public_key) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for accessory public key",
+                             accessory_public_key_size);
+
+                send_tlv_error_response(context, 6, TLVError_Authentication);
+                break;
+            }
+
             r = crypto_ed25519_export_public_key(&context->server->accessory_key, accessory_public_key, &accessory_public_key_size);
             if (r) {
                 CLIENT_ERROR(context, "Failed to export accessory public key (code %d)", r);
@@ -1378,6 +1537,15 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             size_t accessory_id_size = sizeof(context->server->accessory_id) - 1;
             size_t accessory_info_size = HKDF_HASH_SIZE + accessory_id_size + accessory_public_key_size;
             byte *accessory_info = malloc(accessory_info_size);
+            if (!accessory_info) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for AccessoryX",
+                             accessory_info_size);
+
+                free(accessory_public_key);
+
+                send_tlv_error_response(context, 6, TLVError_Unknown);
+                break;
+            }
 
             CLIENT_DEBUG(context, "Calculating AccessoryX");
             size_t accessory_x_size = accessory_info_size;
@@ -1414,6 +1582,17 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             );
 
             byte *accessory_signature = malloc(accessory_signature_size);
+            if (!accessory_signature) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for accessory signature",
+                             accessory_signature_size);
+
+                free(accessory_public_key);
+                free(accessory_info);
+
+                send_tlv_error_response(context, 6, TLVError_Unknown);
+                break;
+            }
+
             r = crypto_ed25519_sign(
                 &context->server->accessory_key,
                 accessory_info, accessory_info_size,
@@ -1433,6 +1612,16 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             free(accessory_info);
 
             tlv_values_t *response_message = tlv_new();
+            if (!response_message) {
+                CLIENT_ERROR(context, "Failed to allocate memory for TLV response");
+
+                free(accessory_signature);
+                free(accessory_public_key);
+
+                send_tlv_error_response(context, 6, TLVError_Unknown);
+                break;
+            }
+
             tlv_add_value(response_message, TLVType_Identifier,
                           (byte *)context->server->accessory_id, accessory_id_size);
             tlv_add_value(response_message, TLVType_PublicKey,
@@ -1449,6 +1638,16 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             tlv_format(response_message, NULL, &response_data_size);
 
             byte *response_data = malloc(response_data_size);
+            if (!response_data) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for TLV response",
+                             response_data_size);
+
+                tlv_free(response_message);
+
+                send_tlv_error_response(context, 6, TLVError_Unknown);
+                break;
+            }
+
             r = tlv_format(response_message, response_data, &response_data_size);
             if (r) {
                 CLIENT_ERROR(context, "Failed to format TLV response (code %d)", r);
@@ -1471,6 +1670,16 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             );
 
             byte *encrypted_response_data = malloc(encrypted_response_data_size);
+            if (!encrypted_response_data) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for encrypted response data",
+                             encrypted_response_data_size);
+
+                free(response_data);
+
+                send_tlv_error_response(context, 6, TLVError_Unknown);
+                break;
+            }
+
             r = crypto_chacha20poly1305_encrypt(
                 shared_secret, (byte *)"\x0\x0\x0\x0PS-Msg06", NULL, 0,
                 response_data, response_data_size,
@@ -1489,6 +1698,15 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             }
 
             tlv_values_t *response = tlv_new();
+            if (!response) {
+                CLIENT_ERROR(context, "Failed to allocate memory for TLV response");
+
+                free(encrypted_response_data);
+
+                send_tlv_error_response(context, 6, TLVError_Unknown);
+                break;
+            }
+
             tlv_add_integer_value(response, TLVType_State, 1, 6);
             tlv_add_value(response, TLVType_EncryptedData,
                           encrypted_response_data, encrypted_response_data_size);
@@ -1528,12 +1746,22 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
     homekit_overclock_start();
 #endif
 
+    int r;
+
     tlv_values_t *message = tlv_new();
-    tlv_parse(data, size, message);
+    if (!message) {
+        CLIENT_ERROR(context, "Failed to allocate memory for TLV payload");
+        return;
+    }
+
+    r = tlv_parse(data, size, message);
+    if (r) {
+        CLIENT_ERROR(context, "Failed to parse TLV payload (code %d)", r);
+        tlv_free(message);
+        return;
+    }
 
     TLV_DEBUG(message);
-
-    int r;
 
     switch(tlv_get_integer_value(message, TLVType_State, -1)) {
         case 1: {
@@ -1581,6 +1809,15 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             crypto_curve25519_export_public(&my_key, NULL, &my_key_public_size);
 
             byte *my_key_public = malloc(my_key_public_size);
+            if (!my_key_public) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for exporting accessory Curve25519 public key",
+                             my_key_public_size);
+                crypto_curve25519_done(&my_key);
+                crypto_curve25519_done(&device_key);
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
+
             r = crypto_curve25519_export_public(&my_key, my_key_public, &my_key_public_size);
             if (r) {
                 CLIENT_ERROR(context, "Failed to export accessory Curve25519 public key (code %d)", r);
@@ -1596,6 +1833,14 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             crypto_curve25519_shared_secret(&my_key, &device_key, NULL, &shared_secret_size);
 
             byte *shared_secret = malloc(shared_secret_size);
+            if (!shared_secret) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for Curve25519 shared secret",
+                             shared_secret_size);
+                free(my_key_public);
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
+
             r = crypto_curve25519_shared_secret(&my_key, &device_key, shared_secret, &shared_secret_size);
             crypto_curve25519_done(&my_key);
             crypto_curve25519_done(&device_key);
@@ -1613,6 +1858,15 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             size_t accessory_info_size = my_key_public_size + accessory_id_size + tlv_device_public_key->size;
 
             byte *accessory_info = malloc(accessory_info_size);
+            if (!accessory_info) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for accessory info",
+                             accessory_info_size);
+                free(shared_secret);
+                free(my_key_public);
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
+
             memcpy(accessory_info,
                    my_key_public, my_key_public_size);
             memcpy(accessory_info + my_key_public_size,
@@ -1628,6 +1882,16 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             );
 
             byte *accessory_signature = malloc(accessory_signature_size);
+            if (!accessory_signature) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for accessory signature",
+                             accessory_signature_size);
+                free(accessory_info);
+                free(shared_secret);
+                free(my_key_public);
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
+
             r = crypto_ed25519_sign(
                 &context->server->accessory_key,
                 accessory_info, accessory_info_size,
@@ -1644,6 +1908,14 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             }
 
             tlv_values_t *sub_response = tlv_new();
+            if (!sub_response) {
+                CLIENT_ERROR(context, "Failed to allocate memory for TLV sub response");
+                free(accessory_signature);
+                free(shared_secret);
+                free(my_key_public);
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
             tlv_add_value(sub_response, TLVType_Identifier,
                           (const byte *)context->server->accessory_id, accessory_id_size);
             tlv_add_value(sub_response, TLVType_Signature,
@@ -1655,6 +1927,15 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             tlv_format(sub_response, NULL, &sub_response_data_size);
 
             byte *sub_response_data = malloc(sub_response_data_size);
+            if (!sub_response_data) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for sub-TLV message",
+                             sub_response_data_size);
+                free(shared_secret);
+                free(my_key_public);
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
+
             r = tlv_format(sub_response, sub_response_data, &sub_response_data_size);
             tlv_free(sub_response);
 
@@ -1679,6 +1960,16 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             );
 
             byte *session_key = malloc(session_key_size);
+            if (!session_key) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for session key",
+                             session_key_size);
+                free(sub_response_data);
+                free(shared_secret);
+                free(my_key_public);
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
+
             r = crypto_hkdf(
                 shared_secret, shared_secret_size,
                 salt, sizeof(salt)-1,
@@ -1704,6 +1995,17 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             );
 
             byte *encrypted_response_data = malloc(encrypted_response_data_size);
+            if (!encrypted_response_data) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for encrypting sub response data",
+                             encrypted_response_data_size);
+                free(sub_response_data);
+                free(session_key);
+                free(shared_secret);
+                free(my_key_public);
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
+
             r = crypto_chacha20poly1305_encrypt(
                 session_key, (byte *)"\x0\x0\x0\x0PV-Msg02", NULL, 0,
                 sub_response_data, sub_response_data_size,
@@ -1722,6 +2024,15 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             }
 
             tlv_values_t *response = tlv_new();
+            if (!response) {
+                CLIENT_ERROR(context, "Failed to allocate memory for TLV response");
+                free(encrypted_response_data);
+                free(session_key);
+                free(shared_secret);
+                free(my_key_public);
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
             tlv_add_integer_value(response, TLVType_State, 1, 2);
             tlv_add_value(response, TLVType_PublicKey,
                           my_key_public, my_key_public_size);
@@ -1736,6 +2047,14 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
                 pair_verify_context_free(context->verify_context);
 
             context->verify_context = pair_verify_context_new();
+            if (!context->verify_context) {
+                CLIENT_ERROR(context, "Failed to allocate memory for verify context");
+                free(session_key);
+                free(shared_secret);
+                free(my_key_public);
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
             context->verify_context->secret = shared_secret;
             context->verify_context->secret_size = shared_secret_size;
 
@@ -1746,6 +2065,15 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             context->verify_context->accessory_public_key_size = my_key_public_size;
 
             context->verify_context->device_public_key = malloc(tlv_device_public_key->size);
+            if (!context->verify_context->device_public_key) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for device public key",
+                             tlv_device_public_key->size);
+                pair_verify_context_free(context->verify_context);
+                context->verify_context = NULL;
+
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
             memcpy(context->verify_context->device_public_key,
                    tlv_device_public_key->value, tlv_device_public_key->size);
             context->verify_context->device_public_key_size = tlv_device_public_key->size;
@@ -1781,6 +2109,17 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             );
 
             byte *decrypted_data = malloc(decrypted_data_size);
+            if (!decrypted_data) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for decrypt data",
+                             decrypted_data_size);
+
+                pair_verify_context_free(context->verify_context);
+                context->verify_context = NULL;
+
+                send_tlv_error_response(context, 4, TLVError_Authentication);
+                break;
+            }
+
             r = crypto_chacha20poly1305_decrypt(
                 context->verify_context->session_key, (byte *)"\x0\x0\x0\x0PV-Msg03", NULL, 0,
                 tlv_encrypted_data->value, tlv_encrypted_data->size,
@@ -1798,6 +2137,16 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             }
 
             tlv_values_t *decrypted_message = tlv_new();
+            if (!decrypted_message) {
+                CLIENT_ERROR(context, "Failed to allocate memory for decrypted message");
+
+                free(decrypted_data);
+                pair_verify_context_free(context->verify_context);
+                context->verify_context = NULL;
+
+                send_tlv_error_response(context, 4, TLVError_Authentication);
+                break;
+            }
             r = tlv_parse(decrypted_data, decrypted_data_size, decrypted_message);
             free(decrypted_data);
 
@@ -1837,6 +2186,17 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             }
 
             char *device_id = strndup((const char *)tlv_device_id->value, tlv_device_id->size);
+            if (!device_id) {
+                CLIENT_ERROR(context, "Failed to allocate memory for device ID");
+
+                tlv_free(decrypted_message);
+                pair_verify_context_free(context->verify_context);
+                context->verify_context = NULL;
+
+                send_tlv_error_response(context, 4, TLVError_Authentication);
+                break;
+            }
+
             CLIENT_DEBUG(context, "Searching pairing with %s", device_id);
             pairing_t pairing;
             if (homekit_storage_find_pairing(device_id, &pairing)) {
@@ -1863,6 +2223,18 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
                 tlv_device_id->size;
 
             byte *device_info = malloc(device_info_size);
+            if (!device_info) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for device info",
+                             device_info_size);
+
+                tlv_free(decrypted_message);
+                pair_verify_context_free(context->verify_context);
+                context->verify_context = NULL;
+
+                send_tlv_error_response(context, 4, TLVError_Authentication);
+                break;
+            }
+
             memcpy(device_info,
                    context->verify_context->device_public_key, context->verify_context->device_public_key_size);
             memcpy(device_info + context->verify_context->device_public_key_size,
@@ -1930,6 +2302,13 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             }
 
             tlv_values_t *response = tlv_new();
+            if (!response) {
+                CLIENT_ERROR(context, "Failed to allocate memory for TLV response");
+
+                send_tlv_error_response(context, 4, TLVError_Unknown);
+                break;
+            }
+
             tlv_add_integer_value(response, TLVType_State, 1, 4);
 
             send_tlv_response(context, response);
@@ -1964,7 +2343,10 @@ void homekit_server_on_get_accessories(client_context_t *context) {
 
     client_send(context, json_200_response_headers, sizeof(json_200_response_headers)-1);
 
-    json_stream *json = json_new(1024, client_send_chunk, context);
+    json_stream *json = context->server->json;
+    json_set_context(json, context);
+    json_reset(json);
+
     json_object_start(json);
     json_string(json, "accessories"); json_array_start(json);
 
@@ -2022,7 +2404,6 @@ void homekit_server_on_get_accessories(client_context_t *context) {
     json_object_end(json); // response
 
     json_flush(json);
-    json_free(json);
 
     client_send_chunk(NULL, 0, context);
 }
@@ -2101,7 +2482,10 @@ void homekit_server_on_get_characteristics(client_context_t *context) {
         client_send(context, json_207_response_headers, sizeof(json_207_response_headers)-1);
     }
 
-    json_stream *json = json_new(256, client_send_chunk, context);
+    json_stream *json = context->server->json;
+    json_set_context(json, context);
+    json_reset(json);
+
     json_object_start(json);
     json_string(json, "characteristics"); json_array_start(json);
 
@@ -2144,7 +2528,6 @@ void homekit_server_on_get_characteristics(client_context_t *context) {
     json_object_end(json); // response
 
     json_flush(json);
-    json_free(json);
 
     client_send_chunk(NULL, 0, context);
 
@@ -2438,6 +2821,13 @@ void homekit_server_on_update_characteristics(client_context_t *context, const b
 
                     size_t tlv_size = base64_decoded_size((unsigned char*)value, value_len);
                     byte *tlv_data = malloc(tlv_size);
+                    if (!tlv_data) {
+                        CLIENT_ERROR(context,
+                                     "Failed to update %d.%d: "
+                                     "error allocating %d bytes for Base64 decoding",
+                                     aid, iid, tlv_size);
+                        return HAPStatus_InvalidValue;
+                    }
                     if (base64_decode((byte*) value, value_len, tlv_data) < 0) {
                         free(tlv_data);
                         CLIENT_ERROR(context, "Failed to update %d.%d: error Base64 decoding", aid, iid);
@@ -2445,6 +2835,11 @@ void homekit_server_on_update_characteristics(client_context_t *context, const b
                     }
 
                     tlv_values_t *tlv_values = tlv_new();
+                    if (!tlv_values) {
+                        free(tlv_data);
+                        CLIENT_ERROR(context, "Failed to update %d.%d: error allocating memory for TLV values", aid, iid);
+                        return HAPStatus_InvalidValue;
+                    }
                     int r = tlv_parse(tlv_data, tlv_size, tlv_values);
                     free(tlv_data);
 
@@ -2490,6 +2885,14 @@ void homekit_server_on_update_characteristics(client_context_t *context, const b
 
                     size_t data_size = base64_decoded_size((unsigned char*)value, value_len);
                     byte *data = malloc(data_size);
+                    if (!data) {
+                        CLIENT_ERROR(context,
+                                     "Failed to update %d.%d: "
+                                     "error allocating %d bytes for Base64 decoding",
+                                     aid, iid, data_size);
+                        return HAPStatus_InvalidValue;
+                    }
+
                     if (base64_decode((byte*) value, value_len, data) < 0) {
                         free(data);
                         CLIENT_ERROR(context, "Failed to update %d.%d: error Base64 decoding", aid, iid);
@@ -2545,6 +2948,14 @@ void homekit_server_on_update_characteristics(client_context_t *context, const b
     }
 
     HAPStatus *statuses = malloc(sizeof(HAPStatus) * cJSON_GetArraySize(characteristics));
+    if (!statuses) {
+        CLIENT_ERROR(context, "Failed to allocate %d bytes for characteristic update statuses",
+                     sizeof(HAPStatus) * cJSON_GetArraySize(characteristics));
+
+        send_json_error_response(context, 500, HAPStatus_OutOfResources);
+        cJSON_Delete(json);
+        return;
+    }
     bool has_errors = false;
     for (int i=0; i < cJSON_GetArraySize(characteristics); i++) {
         cJSON *j_ch = cJSON_GetArrayItem(characteristics, i);
@@ -2564,10 +2975,13 @@ void homekit_server_on_update_characteristics(client_context_t *context, const b
 
         send_204_response(context);
     } else {
+        json_stream *json1 = context->server->json;
+        json_set_context(json1, context);
+        json_reset(json1);
+
         CLIENT_DEBUG(context, "There were processing errors, sending Multi-Status response");
         client_send(context, json_207_response_headers, sizeof(json_207_response_headers)-1);
 
-        json_stream *json1 = json_new(1024, client_send_chunk, context);
         json_object_start(json1);
         json_string(json1, "characteristics"); json_array_start(json1);
 
@@ -2585,7 +2999,6 @@ void homekit_server_on_update_characteristics(client_context_t *context, const b
         json_object_end(json1); // response
 
         json_flush(json1);
-        json_free(json1);
 
         client_send_chunk(NULL, 0, context);
     }
@@ -2599,7 +3012,17 @@ void homekit_server_on_pairings(client_context_t *context, const byte *data, siz
     DEBUG_HEAP();
 
     tlv_values_t *message = tlv_new();
-    tlv_parse(data, size, message);
+    if (!message) {
+        CLIENT_ERROR(context, "Failed to allocate memory for TLV payload");
+        send_tlv_error_response(context, 2, TLVError_Unknown);
+        return;
+    }
+    if (tlv_parse(data, size, message)) {
+        CLIENT_ERROR(context, "Failed to parse TLV payload");
+        tlv_free(message);
+        send_tlv_error_response(context, 2, TLVError_Unknown);
+        return;
+    }
 
     TLV_DEBUG(message);
 
@@ -2655,6 +3078,11 @@ void homekit_server_on_pairings(client_context_t *context, const byte *data, siz
                 (const char *)tlv_device_identifier->value,
                 tlv_device_identifier->size
             );
+            if (!device_identifier) {
+                CLIENT_ERROR(context, "Failed to allocate memory for device identifier");
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
 
             pairing_t pairing;
             if (!homekit_storage_find_pairing(device_identifier, &pairing)) {
@@ -2662,12 +3090,21 @@ void homekit_server_on_pairings(client_context_t *context, const byte *data, siz
                 crypto_ed25519_export_public_key(&pairing.device_key, NULL, &pairing_public_key_size);
 
                 byte *pairing_public_key = malloc(pairing_public_key_size);
+                if (!pairing_public_key) {
+                    CLIENT_ERROR(context, "Failed to allocate %d bytes for pairing public key",
+                                 pairing_public_key_size);
+                    free(device_identifier);
+                    send_tlv_error_response(context, 2, TLVError_Unknown);
+                    break;
+                }
+
                 r = crypto_ed25519_export_public_key(&pairing.device_key, pairing_public_key, &pairing_public_key_size);
                 if (r) {
                     CLIENT_ERROR(context, "Failed to add pairing: error exporting pairing public key (code %d)", r);
                     free(pairing_public_key);
                     free(device_identifier);
                     send_tlv_error_response(context, 2, TLVError_Unknown);
+                    break;
                 }
 
                 if (pairing_public_key_size != tlv_device_public_key->size ||
@@ -2676,6 +3113,7 @@ void homekit_server_on_pairings(client_context_t *context, const byte *data, siz
                     free(pairing_public_key);
                     free(device_identifier);
                     send_tlv_error_response(context, 2, TLVError_Unknown);
+                    break;
                 }
 
                 free(pairing_public_key);
@@ -2715,6 +3153,11 @@ void homekit_server_on_pairings(client_context_t *context, const byte *data, siz
             free(device_identifier);
 
             tlv_values_t *response = tlv_new();
+            if (!response) {
+                CLIENT_ERROR(context, "Failed to allocate memory for response TLV data");
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
             tlv_add_integer_value(response, TLVType_State, 1, 2);
 
             send_tlv_response(context, response);
@@ -2741,6 +3184,11 @@ void homekit_server_on_pairings(client_context_t *context, const byte *data, siz
                 (const char *)tlv_device_identifier->value,
                 tlv_device_identifier->size
             );
+            if (!device_identifier) {
+                CLIENT_ERROR(context, "Failed to allocate memory for device identifier");
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
 
             pairing_t pairing;
             if (!homekit_storage_find_pairing(device_identifier, &pairing)) {
@@ -2794,6 +3242,11 @@ void homekit_server_on_pairings(client_context_t *context, const byte *data, siz
             free(device_identifier);
 
             tlv_values_t *response = tlv_new();
+            if (!response) {
+                CLIENT_ERROR(context, "Failed to allocate memory for response TLV data");
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
             tlv_add_integer_value(response, TLVType_State, 1, 2);
 
             send_tlv_response(context, response);
@@ -2809,6 +3262,11 @@ void homekit_server_on_pairings(client_context_t *context, const byte *data, siz
             }
 
             tlv_values_t *response = tlv_new();
+            if (!response) {
+                CLIENT_ERROR(context, "Failed to allocate memory for response TLV data");
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
             tlv_add_integer_value(response, TLVType_State, 1, 2);
 
             bool first = true;
@@ -2845,17 +3303,6 @@ void homekit_server_on_pairings(client_context_t *context, const byte *data, siz
     }
 
     tlv_free(message);
-}
-
-void homekit_server_on_reset(client_context_t *context) {
-    INFO("Reset");
-
-    homekit_server_reset();
-    send_204_response(context);
-
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
-
-    homekit_system_restart();
 }
 
 void homekit_server_on_resource(client_context_t *context) {
@@ -3037,6 +3484,11 @@ static void homekit_client_process(client_context_t *context) {
         client_decrypt(context, context->data, data_len, NULL, &decrypted_size);
 
         decrypted = malloc(decrypted_size);
+        if (!decrypted) {
+            CLIENT_ERROR(context, "Failed to allocate %d bytes to decrypt client payload", decrypted_size);
+            return;
+        }
+
         int r = client_decrypt(context, context->data, data_len, decrypted, &decrypted_size);
         if (r < 0) {
             CLIENT_ERROR(context, "Invalid client data");
@@ -3172,6 +3624,11 @@ client_context_t *homekit_server_accept_client(homekit_server_t *server) {
     setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &maxpkt, sizeof(maxpkt));
 
     context = client_context_new();
+    if (!context) {
+        ERROR("Failed to allocate memory for client context");
+        close(s);
+        return NULL;
+    }
     context->server = server;
     context->socket = s;
     context->next = server->clients;
@@ -3208,6 +3665,15 @@ void homekit_server_process_notifications(homekit_server_t *server) {
         if (xQueueReceive(context->event_queue, &event, 0)) {
             // Get and coalesce all client events
             client_event_t *events_head = malloc(sizeof(client_event_t));
+            if (!events_head) {
+                ERROR("Failed to allocate %d bytes for characteristic event processing",
+                      sizeof(client_event_t));
+
+                homekit_value_destruct(&event->value);
+                free(event);
+                continue;
+            }
+
             events_head->characteristic = event->characteristic;
             homekit_value_copy(&events_head->value, &event->value);
             events_head->next = NULL;
@@ -3230,6 +3696,14 @@ void homekit_server_process_notifications(homekit_server_t *server) {
                     homekit_value_destruct(&e->value);
                 } else {
                     e = malloc(sizeof(client_event_t));
+                    if (!e) {
+                        ERROR("Failed to allocate %d bytes for characteristic event processing",
+                              sizeof(client_event_t));
+
+                        homekit_value_destruct(&event->value);
+                        free(event);
+                        continue;
+                    }
                     e->characteristic = event->characteristic;
                     e->next = NULL;
 
@@ -3401,21 +3875,25 @@ void homekit_setup_mdns(homekit_server_t *server) {
 
         size_t data_size = strlen(server->config->setupId) + strlen(server->accessory_id) + 1;
         char *data = malloc(data_size);
-        snprintf(data, data_size, "%s%s", server->config->setupId, server->accessory_id);
-        data[data_size-1] = 0;
+        if (!data) {
+            ERROR("Failed to allocate %d bytes for generating setup ID hash", data_size);
+        } else {
+            snprintf(data, data_size, "%s%s", server->config->setupId, server->accessory_id);
+            data[data_size-1] = 0;
 
-        unsigned char shaHash[SHA512_DIGEST_SIZE];
-        wc_Sha512Hash((const unsigned char *)data, data_size-1, shaHash);
+            unsigned char shaHash[SHA512_DIGEST_SIZE];
+            wc_Sha512Hash((const unsigned char *)data, data_size-1, shaHash);
 
-        free(data);
+            free(data);
 
-        unsigned char encodedHash[9];
-        memset(encodedHash, 0, sizeof(encodedHash));
+            unsigned char encodedHash[9];
+            memset(encodedHash, 0, sizeof(encodedHash));
 
-        word32 len = sizeof(encodedHash);
-        Base64_Encode_NoNl((const unsigned char *)shaHash, 4, encodedHash, &len);
+            word32 len = sizeof(encodedHash);
+            Base64_Encode_NoNl((const unsigned char *)shaHash, 4, encodedHash, &len);
 
-        homekit_mdns_add_txt("sh", "%s", encodedHash);
+            homekit_mdns_add_txt("sh", "%s", encodedHash);
+        }
     }
 
     homekit_mdns_configure_finalize();
@@ -3547,6 +4025,11 @@ void homekit_server_init(homekit_server_config_t *config) {
     }
 
     homekit_server_t *server = server_new();
+    if (!server) {
+        ERROR("Error initializing HomeKit accessory server: "
+              "failed to allocate memory for server");
+        return;
+    }
     server->config = config;
 
     if (pdPASS != xTaskCreate(homekit_server_task, "HomeKit Server",
