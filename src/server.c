@@ -134,6 +134,7 @@ typedef struct {
 
     byte data[1024 + 18];
     byte decrypted[1024];
+    byte output_buffer[1024];
 
     char *body;
     size_t body_length;
@@ -142,7 +143,7 @@ typedef struct {
 
     bool request_completed;
 
-    json_stream *json;
+    json_stream json;
 
     SemaphoreHandle_t notification_lock;
     uint16_t notify_count;
@@ -218,18 +219,13 @@ homekit_server_t *server_new() {
     server->body_static = false;
     http_parser_init(&server->parser, HTTP_REQUEST);
 
-    server->json = json_new(1024, client_send_chunk, NULL);
-    if (!server->json) {
-        free(server);
-        return NULL;
-    }
+    json_init(&server->json, server->output_buffer, sizeof(server->output_buffer), client_send_chunk, NULL);
 
     server->client_ids = bitset_new(HOMEKIT_MAX_CLIENTS);
 
     server->notification_lock = xSemaphoreCreateBinary();
     if (!server->notification_lock) {
         bitset_free(server->client_ids);
-        json_free(server->json);
         free(server);
         return NULL;
     }
@@ -264,10 +260,6 @@ void server_free(homekit_server_t *server) {
 
     if (server->notification_lock) {
         vSemaphoreDelete(server->notification_lock);
-    }
-
-    if (server->json) {
-        json_free(server->json);
     }
 
     if (server->body)
@@ -2337,7 +2329,7 @@ void homekit_server_on_get_accessories(client_context_t *context) {
 
     client_send(context, json_200_response_headers, sizeof(json_200_response_headers)-1);
 
-    json_stream *json = context->server->json;
+    json_stream *json = &context->server->json;
     json_set_context(json, context);
     json_reset(json);
 
@@ -2442,7 +2434,7 @@ void homekit_server_on_get_characteristics(client_context_t *context) {
         client_send(context, json_207_response_headers, sizeof(json_207_response_headers)-1);
     }
 
-    json_stream *json = context->server->json;
+    json_stream *json = &context->server->json;
     json_set_context(json, context);
     json_reset(json);
 
@@ -2937,7 +2929,7 @@ void homekit_server_on_update_characteristics(client_context_t *context, const b
 
         send_204_response(context);
     } else {
-        json_stream *json1 = context->server->json;
+        json_stream *json1 = &context->server->json;
         json_set_context(json1, context);
         json_reset(json1);
 
@@ -3714,7 +3706,7 @@ void homekit_server_process_notifications(homekit_server_t *server) {
     while (context) {
         bool first = true;
 
-        json_stream *json = context->server->json;
+        json_stream *json = &context->server->json;
         json_set_context(json, context);
         json_reset(json);
 
