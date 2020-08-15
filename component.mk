@@ -78,6 +78,8 @@ ifdef component_compile_rules
     homekit_CFLAGS += -DHOMEKIT_DEBUG
     endif
 
+    homekit_CFLAGS += -DINCLUDE_uxTaskGetStackHighWaterMark=1
+
 erase_homekit_data:
 	$(ESPTOOL) erase_region $(HOMEKIT_SPI_FLASH_BASE_ADDR) 4096
 

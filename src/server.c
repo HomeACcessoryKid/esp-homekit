@@ -3713,6 +3713,7 @@ void homekit_server_close_clients(homekit_server_t *server) {
 static void homekit_run_server(homekit_server_t *server)
 {
     DEBUG("Starting HTTP server");
+    UBaseType_t uxHighWaterMark=SERVER_TASK_STACK;
 
     struct sockaddr_in serv_addr;
     server->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -3778,6 +3779,11 @@ static void homekit_run_server(homekit_server_t *server)
         }
 
         homekit_server_process_notifications(server);
+        
+        if (uxHighWaterMark > uxTaskGetStackHighWaterMark(NULL)) {
+            uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
+            INFO("HighWaterMark %lu bytes",uxHighWaterMark*4);
+        }
     }
 
     server_free(server);
